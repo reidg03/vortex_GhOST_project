@@ -1,0 +1,143 @@
+================================================================================
+GHOST COMPONENT & IMPLEMENTATION CHECKLIST
+Based on "GhOST: a GPU Out-of-Order Scheduling Technique for Stall Reduction" (ISCA 2024)
+================================================================================
+
+--------------------------------------------------------------------------------
+COMPONENT 1: DEPENDENCE CHECKER (DC)
+--------------------------------------------------------------------------------
+Role: Time-shared module between Fetch/Decode and Issue Buffer (IsB) performing 
+      intra-buffer dependency calculation (IB-Calc).
+
+1. Structure & Capacity
+[ ] Multiplicity: 4 time-shared DC modules per scheduler (matches decode throughput).
+[ ] Internal Engines: 8 parallel IB-Calc units per DC to check incoming instruction 
+    concurrently against up to 8 instructions in the IsB.
+[ ] Metadata Field Requirements (111 bits total per entry):
+    [ ] Valid (1 bit): Indicates valid instruction state (no control hazards).
+    [ ] Index / Idx (3 bits): Tracks relative order/age of instructions in warp's buffer (IdxVal).
+    [ ] Mask (32 bits): Active thread execution mask copied from the SIMT stack.
+    [ ] IB-dep (11 bits total): Bit-vector tracking dependencies:
+        - 8 bits corresponding to slot positions in the IsB.
+        - 3 bits for in-flight execution pipeline dependencies (RAW/WAW).
+    [ ] Instruction (64 bits): Raw decoded SIMT instruction payload.
+    [ ] IsLoad (1 bit): Flag set if instruction reads from memory.
+    [ ] IsStore (1 bit): Flag set if instruction writes to memory or is an atomic.
+
+2. Inputs & Connectivity
+[ ] From Fetch/Decode: Decoded 64-bit instruction, source registers (Source1, Source2, 
+    Source3), destination register (Destination), opcode type (IsLoad, IsStore, IsBarrier).
+[ ] From SIMT Stack: Active thread execution mask (Mask).
+[ ] From Warp Decode Scheduler: Next warp ID and current warp IdxVal counter.
+[ ] From Issue Buffer (IsB): Register targets and instruction types of all 8 buffered 
+    entries for the active warp.
+
+3. Logic & Rules Enforced
+[ ] Data Dependency Check (Intra-Buffer RAW, WAR, WAW):
+    [ ] Compare Source1, Source2, Source3 of incoming inst vs Destination of each IsB entry (RAW).
+    [ ] Compare Destination of incoming inst vs Source1, Source2, Source3 of each IsB entry (WAR).
+    [ ] Compare Destination of incoming inst vs Destination of each IsB entry (WAW).
+    [ ] If any match occurs, set the bit for that IsB slot position in incoming IB-dep vector to 1.
+[ ] Memory Ordering Rule (Load-Load Only):
+    [ ] If incoming inst is Load/Store and an older IsB entry is Store/Atomic: set IB-dep bit to 1.
+    [ ] Allow Load-Load reordering without setting IB-dep bits.
+    [ ] Block reordering for compiler-marked Atomic operations.
+[ ] Control Instructions (Branches):
+    [ ] Allow branch instructions to reorder against older unissued IsB insts if data-independent.
+    [ ] Do NOT allow instructions fetched AFTER a branch to issue until the branch resolves 
+        (no speculative execution / no branch prediction).
+    [ ] Pop execution mask from SIMT stack into DC to prevent serialization at convergence points.
+[ ] Synchronization Instructions (syncthreads / bar):
+    [ ] Hold syncthreads in DC; do NOT move to IsB until all prior insts in warp's IsB issue.
+    [ ] Raise global Control Flag once syncthreads enters IsB to halt pushing new insts to DC.
+    [ ] Unset Control Flag only after syncthreads issues and resolves.
+
+4. Outputs
+[ ] Complete 111-bit entry output to the Issue Buffer (IsB).
+[ ] Incremented IdxVal counter per warp.
+[ ] Pop signal sent to the SIMT stack.
+
+
+--------------------------------------------------------------------------------
+COMPONENT 2: ISSUE BUFFER (IsB)
+--------------------------------------------------------------------------------
+Role: Main storage structure holding decoded instructions and dynamic dependency 
+      states for every warp managed by the scheduler.
+
+1. Structure & Banking
+[ ] Capacity: Holds up to 8 instructions per warp (8 entries/warp).
+[ ] Banking Layout: Structured as an 8-way banked storage array (each bank corresponds 
+    to a specific warp index).
+[ ] Tracking Queue: Contains a Location Pointer FIFO queue per warp to track available empty slots.
+
+2. Inputs & Connectivity
+[ ] From DC: Decoded instruction payload, Mask, Idx, IsLoad, IsStore, and IB-dep vector.
+[ ] From Writeback Stage: Broadcast signal when an instruction completes execution.
+[ ] From Issue Stage: Signal indicating an instruction has issued out of the ITab.
+
+3. Logic & State Management
+[ ] Insertion Logic:
+    [ ] Read target slot index from Location Pointer FIFO.
+    [ ] Write 111-bit entry from DC into the designated bank slot.
+    [ ] If Location Pointer is empty, mark IsB as FULL to stall DC transfer.
+[ ] Dynamic Dep-Bit Clearing (Upon Issue):
+    [ ] When an instruction in slot K issues: iterate over all remaining entries in the 
+        same warp's IsB and set bit K of their IB-dep vectors to 0.
+    [ ] Decrement Idx by 1 for all entries in the warp buffer with Idx > Idx_issued.
+    [ ] Mark slot K as invalid and push slot K's bank ID back into warp's Location Pointer FIFO.
+[ ] Dynamic Dep-Bit Clearing (Upon Execution Writeback):
+    [ ] Clear execution scoreboard dependency bits in the IB-dep vector when in-flight 
+        instructions finish writeback.
+
+4. Outputs
+[ ] Parallel read outputs (valid bit, IB-dep, source/dest registers, Idx) supplied to the 
+    GhOST Scheduler's Register Dependence Checker (RDC).
+[ ] Full status flag sent back to DC.
+
+
+--------------------------------------------------------------------------------
+COMPONENT 3: GHOST SCHEDULER & INSTRUCTION TABLE (ITab)
+--------------------------------------------------------------------------------
+Role: Time-shared filtering engine that inspects the IsB, filters for hazard-free 
+      instructions, and populates the ITab for the Warp Scheduler to consume.
+
+1. Structure & Capacity
+[ ] Warp-WriteBack Vector (WWb): Bit-vector (1 bit per warp); set on writeback signal.
+[ ] ITab Empty Vector (ITE): Bit-vector (1 bit per warp); set when warp has space in ITab.
+[ ] Instruction Table (ITab): Holds up to 2 candidate instructions per warp.
+[ ] Register Dependence Checker (RDC): Logic matrix verifying IB-dep == 0 AND execution 
+    scoreboard cleared.
+[ ] Oldest Instruction Selection Logic (OSel): Priority comparator network selecting the 
+    2 lowest Idx values among ready candidates.
+
+2. Inputs & Connectivity
+[ ] From IsB: Valid bits, IB-dep vectors, Idx values, and bank slot IDs for all warps.
+[ ] From In-Flight Scoreboard: Execution hazard flags.
+[ ] From Writeback: Writeback completion pulses (triggers WWb bit).
+[ ] Interface to Warp Scheduler: 2 read pointers/instructions per warp in the ITab.
+
+3. Logic & Selection Workflow
+[ ] Warp Inspection Triggering:
+    [ ] Evaluate warp IF WWb[warp] == 1 OR ITE[warp] == 1.
+    [ ] Clear ITE bit for that warp once new candidate instructions are loaded into ITab.
+[ ] Ready Instruction Filtering (RDC Logic):
+    [ ] Output Ready = 1 for an IsB entry IF Valid == 1 AND IB-dep == 0 AND 
+        In-Flight Scoreboard == CLEAR.
+[ ] Two-Oldest Selection (OSel Logic):
+    [ ] Feed all entries where Ready == 1 into the comparator tree.
+    [ ] Compare Idx values across ready entries.
+    [ ] Output candidate with smallest Idx as Oldest Ready Instruction.
+    [ ] Output candidate with second-smallest Idx as Second Oldest Ready Instruction.
+[ ] ITab Population:
+    [ ] Store selected 1 or 2 instructions in the warp's ITab slots.
+    [ ] Store corresponding IsB bank slot IDs alongside the ITab entries.
+
+4. Warp Scheduler Hand-off (Unmodified Warp Scheduler Interface)
+[ ] Candidate Presentation: Present oldest instruction from ITab to the Warp Scheduler 
+    (e.g., GTO or Round-Robin policy).
+[ ] Fallback Logic: If GhOST has zero ready instructions in ITab for a warp, present the 
+    buffer head (buffer[0]) to the Warp Scheduler.
+[ ] Structural Hazard Check: Standard Warp Scheduler checks functional unit availability 
+    (ALU, LSU, SFU) and issues the instruction.
+[ ] Issue Trigger Signal: When issued, signal IsB to clear slot K, reset dependency 
+    bitmask vectors across younger entries, and update Location Pointer.
