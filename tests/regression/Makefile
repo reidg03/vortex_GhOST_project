@@ -3,7 +3,7 @@ include $(ROOT_DIR)/config.mk
 
 # --- master list ------------------------------------------------------
 TESTS := \
-    minimal                                                           \
+    ghost minimal                                                     \
     basic demo dogfood dropout dotproduct dotproduct2 mstress io_addr \
     arith printf diverge diverge_large sort fence ldst_order          \
     vecadd vecadd_v1 sgemm sgemmx sgemm_v1 conv3 relu sgemv           \
@@ -22,9 +22,9 @@ EXCLUDE :=
 
 # --- per-backend exclude lists ---------------------------------------
 EXCLUDE_simx   :=
-EXCLUDE_rtlsim :=
-EXCLUDE_opae   :=
-EXCLUDE_xrt    :=
+EXCLUDE_rtlsim := ghost
+EXCLUDE_opae   := ghost
+EXCLUDE_xrt    := ghost
 
 BACKENDS := simx rtlsim opae xrt
 

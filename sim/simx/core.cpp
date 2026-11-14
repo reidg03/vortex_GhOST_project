@@ -44,6 +44,9 @@
 #include "processor_impl.h"
 #include "kmu.h"
 #include "debug.h"
+#ifdef SIMX_GHOST_PASSTHROUGH
+#include "ghost.h"
+#endif
 #ifdef VX_CFG_EXT_TCU_ENABLE
 #include "tcu_unit.h"
 #endif
@@ -586,8 +589,12 @@ public:
         if (ibuffer->empty())
           continue;
 
-        // check scoreboard against sequencer micro-op (handles uop WAW/RAW)
         auto trace = ibuffer->peek();
+      #ifdef SIMX_GHOST_PASSTHROUGH
+        trace = ghost_pipeline_.pass_through(trace);
+      #endif
+
+        // check scoreboard against sequencer micro-op (handles uop WAW/RAW)
         auto seq = sequencers_.at(wid);
         auto uop_trace = seq->get(trace);  // returns cached uop or generates next
 
@@ -645,6 +652,7 @@ public:
           }
         #endif
           ready_set.set(w); // mark instruction as ready
+          DT(3, simobject_->name() << "-pipeline issue-candidate: " << *uop_trace);
         }
       }
 
@@ -1084,6 +1092,9 @@ private:
   Scheduler::Ptr scheduler_;
 
   std::vector<TFifo<instr_trace_t*>::Ptr> ibuffers_;
+#ifdef SIMX_GHOST_PASSTHROUGH
+  GhostPipeline ghost_pipeline_;
+#endif
   Scoreboard::Ptr scoreboard_;
   std::vector<Operands::Ptr> operands_;
   std::vector<Dispatcher::Ptr> dispatchers_;
