@@ -1,3 +1,5 @@
+NOT ENTIRELY CORRECT, JUST A REFERENCE
+
 ================================================================================
 GHOST COMPONENT & IMPLEMENTATION CHECKLIST
 Based on "GhOST: a GPU Out-of-Order Scheduling Technique for Stall Reduction" (ISCA 2024)
