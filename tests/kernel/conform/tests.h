@@ -1,0 +1,37 @@
+#ifndef TESTS
+#define TESTS
+
+#define PRINTF vx_printf
+
+int test_global_memory();
+
+int test_local_memory();
+
+int test_tmc();
+
+int test_pred();
+
+int test_divergence();
+
+int test_wsapwn();
+
+int test_spawn_tasks();
+
+int test_serial();
+
+int test_barrier();
+
+int test_tls();
+
+int test_vote();
+
+int test_shfl();
+int test_qshfl();
+
+int test_jalr();
+
+int test_feq_x0_scoreboard();
+
+int test_reserved_funct7();
+
+#endif

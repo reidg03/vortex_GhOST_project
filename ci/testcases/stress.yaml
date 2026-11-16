@@ -1,0 +1,40 @@
+# Test cases for `stress`, drafted from regression.sh.in (review/collapse).
+category: stress
+defaults:
+  xlen:
+  - 32
+  - 64
+  tier: smoke
+  configs: -DVERILATOR_RESET_VALUE=1
+tests:
+- id: dogfood-1
+  via: blackbox
+  drivers:
+  - opae
+  app: dogfood
+  configs+: -DVX_CFG_SOCKET_SIZE=1 -DVX_CFG_DCACHE_WRITEBACK=1 -DVX_CFG_L2_WRITEBACK=1 -DVX_CFG_L3_WRITEBACK=1
+  shape:
+    cores: 2
+    clusters: 2
+    l2cache: true
+    l3cache: true
+- id: sgemm-1
+  via: blackbox
+  drivers:
+  - xrt
+  app: sgemm
+  shape:
+    l2cache: true
+  args: -n128
+# A read must not observe stale data for an address whose write has not yet
+# returned its B response. Response reordering plus withholding builds the
+# response pool that lets the AFU's write path race its own refills;
+# stencil3d's eviction/refill pattern is the trigger.
+- id: axi-store-order
+  via: blackbox
+  drivers:
+  - xrt
+  app: stencil3d
+  env:
+    VX_MEM_RSP_REORDER: 1
+    VX_MEM_RSP_STALL: 6

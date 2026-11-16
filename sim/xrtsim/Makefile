@@ -1,0 +1,242 @@
+include ../common.mk
+
+DESTDIR ?= $(CURDIR)
+
+CONFIG_FILE := $(DESTDIR)/xrtsim_config.stamp
+SRC_DIR := $(VORTEX_HOME)/sim/xrtsim
+AFU_DIR := $(RTL_DIR)/afu/xrt
+AFU_COMMON_DIR := $(RTL_DIR)/afu/common
+
+CXXFLAGS += -std=c++17 -Wall -Wextra -Wfatal-errors -Werror
+CXXFLAGS += -fPIC
+# GCC 13 turns the generated per-word copy of a wide signal into a memcpy and
+# inlines it with aligned 16-byte stores, faulting on a destination that is only
+# 8-byte aligned in the root class (NUM_THREADS=16 + RTU crashes in reset).
+CXXFLAGS += -fno-tree-loop-distribute-patterns
+CXXFLAGS += -I$(SRC_DIR) -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(SIM_COMMON_DIR) -I$(SW_COMMON_DIR) -I$(DESTDIR)
+CXXFLAGS += -I/$(THIRD_PARTY_DIR)/softfloat/source/include
+CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/spdlog/include
+CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/ext/yaml-cpp/include
+CXXFLAGS += -I$(THIRD_PARTY_DIR)/ramulator/src
+CXXFLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
+CXXFLAGS += $(CONFIGS)
+
+LDFLAGS += -shared $(THIRD_PARTY_DIR)/softfloat/build/Linux-x86_64-GCC/softfloat.a
+LDFLAGS += -Wl,-rpath,$(THIRD_PARTY_DIR)/ramulator -L$(THIRD_PARTY_DIR)/ramulator -lramulator -Wl,-rpath,$(THIRD_PARTY_DIR)/ramulator_ext -L$(THIRD_PARTY_DIR)/ramulator_ext -Wl,--push-state,--no-as-needed -lramulator-vortex -Wl,--pop-state -pthread
+
+# control RTL debug tracing states
+DBG_TRACE_FLAGS += -DDBG_TRACE_PIPELINE
+DBG_TRACE_FLAGS += -DDBG_TRACE_MEM
+DBG_TRACE_FLAGS += -DDBG_TRACE_CACHE
+DBG_TRACE_FLAGS += -DDBG_TRACE_AFU
+DBG_TRACE_FLAGS += -DDBG_TRACE_SCOPE
+DBG_TRACE_FLAGS += -DDBG_TRACE_GBAR
+DBG_TRACE_FLAGS += -DDBG_TRACE_TCU
+
+# Control logic analyzer monitors
+DBG_SCOPE_FLAGS += -DDBG_SCOPE_AFU
+DBG_SCOPE_FLAGS += -DDBG_SCOPE_ISSUE
+DBG_SCOPE_FLAGS += -DDBG_SCOPE_FETCH
+DBG_SCOPE_FLAGS += -DDBG_SCOPE_LSU
+
+DBG_FLAGS += -DVX_DBG_DEBUG_LEVEL=$(DEBUG) $(DBG_TRACE_FLAGS)
+
+# `override` so a command-line `make CONFIGS=...` cannot drop these mandatory flags.
+override CONFIGS += -DSIMULATION -DSV_DPI
+
+XCONFIGS := $(shell python3 $(ROOT_DIR)/ci/gen_config.py --config=$(VORTEX_HOME)/VX_config.toml --cflags='$(CONFIGS) -DVX_CFG_XLEN=$(XLEN)')
+
+SRCS = $(SW_COMMON_DIR)/util.cpp $(SIM_COMMON_DIR)/mem.cpp $(SW_COMMON_DIR)/softfloat_ext.cpp $(SW_COMMON_DIR)/rvfloats.cpp $(SIM_COMMON_DIR)/dram_sim.cpp
+SRCS += $(DPI_DIR)/dpi_util.cpp $(DPI_DIR)/dpi_float.cpp
+SRCS += $(SRC_DIR)/xrt_c.cpp $(SRC_DIR)/xrt_sim.cpp
+
+RTL_PKGS += $(RTL_DIR)/VX_gpu_pkg.sv $(RTL_DIR)/fpu/VX_fpu_pkg.sv
+
+FPU_INCLUDE = -I$(RTL_DIR)/fpu
+ifneq (,$(filter -DVX_CFG_FPU_TYPE_FPNEW, $(XCONFIGS)))
+	# fpu_div_sqrt_mvp/hdl/*.sv must be passed explicitly (not auto-
+	# discovered via -I/-y) so the file-scope `import defs_div_sqrt_mvp::*;`
+	# in control_mvp.sv resolves. Verilator parses auto-discovered files
+	# in a separate scope where the file-scope import cannot see the
+	# explicitly-listed defs_div_sqrt_mvp package.
+	RTL_PKGS += $(THIRD_PARTY_DIR)/cvfpu/src/fpnew_pkg.sv \
+	            $(THIRD_PARTY_DIR)/cvfpu/src/common_cells/src/cf_math_pkg.sv \
+	            $(THIRD_PARTY_DIR)/cvfpu/src/fpu_div_sqrt_mvp/hdl/defs_div_sqrt_mvp.sv \
+	            $(THIRD_PARTY_DIR)/cvfpu/src/fpu_div_sqrt_mvp/hdl/control_mvp.sv \
+	            $(THIRD_PARTY_DIR)/cvfpu/src/fpu_div_sqrt_mvp/hdl/iteration_div_sqrt_mvp.sv \
+	            $(THIRD_PARTY_DIR)/cvfpu/src/fpu_div_sqrt_mvp/hdl/norm_div_sqrt_mvp.sv \
+	            $(THIRD_PARTY_DIR)/cvfpu/src/fpu_div_sqrt_mvp/hdl/nrbd_nrsc_mvp.sv \
+	            $(THIRD_PARTY_DIR)/cvfpu/src/fpu_div_sqrt_mvp/hdl/preprocess_mvp.sv \
+	            $(THIRD_PARTY_DIR)/cvfpu/src/fpu_div_sqrt_mvp/hdl/div_sqrt_top_mvp.sv \
+	            $(THIRD_PARTY_DIR)/cvfpu/src/fpu_div_sqrt_mvp/hdl/div_sqrt_mvp_wrapper.sv
+	FPU_INCLUDE += -I$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/include -I$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/src -I$(THIRD_PARTY_DIR)/cvfpu/src
+	FPU_INCLUDE += -y $(THIRD_PARTY_DIR)/cvfpu/src/stubs
+endif
+RTL_INCLUDE = -I$(ROOT_DIR)/sw -I$(ROOT_DIR)/hw -I$(SRC_DIR) -I$(RTL_DIR) -I$(DPI_DIR) -I$(RTL_DIR)/libs -I$(RTL_DIR)/interfaces -I$(RTL_DIR)/core -I$(RTL_DIR)/mem -I$(RTL_DIR)/vm -I$(RTL_DIR)/cache $(FPU_INCLUDE)
+RTL_INCLUDE += -I$(AFU_DIR) -I$(AFU_COMMON_DIR)
+RTL_INCLUDE += -I$(RTL_DIR)/cp
+
+# Add TCU extension sources
+ifneq (,$(filter -DVX_CFG_EXT_TCU_ENABLE, $(XCONFIGS)))
+	RTL_PKGS += $(RTL_DIR)/tcu/VX_tcu_pkg.sv
+	RTL_INCLUDE += -I$(RTL_DIR)/tcu
+	ifneq (,$(filter -DVX_CFG_TCU_TYPE_DPI, $(XCONFIGS)))
+		RTL_INCLUDE += -I$(RTL_DIR)/tcu/dpi
+	else ifneq (,$(filter -DVX_CFG_TCU_TYPE_DSP, $(XCONFIGS)))
+		RTL_INCLUDE += -I$(RTL_DIR)/tcu/dsp
+	else ifneq (,$(filter -DVX_CFG_TCU_TYPE_BHF, $(XCONFIGS)))
+		RTL_INCLUDE += -I$(RTL_DIR)/tcu/bhf
+		RTL_INCLUDE += -J$(THIRD_PARTY_DIR)/hardfloat/source/RISCV
+		RTL_INCLUDE += -I$(THIRD_PARTY_DIR)/hardfloat/source
+	else ifneq (,$(filter -DVX_CFG_TCU_TYPE_FPNEW, $(XCONFIGS)))
+		RTL_PKGS += $(THIRD_PARTY_DIR)/cvfpu/src/fpnew_pkg.sv $(THIRD_PARTY_DIR)/cvfpu/src/common_cells/src/cf_math_pkg.sv
+		RTL_INCLUDE += -I$(RTL_DIR)/tcu/fpnew
+		RTL_INCLUDE += -I$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/include -I$(THIRD_PARTY_DIR)/cvfpu/src/common_cells/src -I$(THIRD_PARTY_DIR)/cvfpu/src
+	else ifneq (,$(filter -DVX_CFG_TCU_TYPE_TFR, $(XCONFIGS)))
+		RTL_INCLUDE += -I$(RTL_DIR)/tcu/tfr
+	else
+		# No explicit TCU type — VX_config.vh defaults to DPI for simulation
+		RTL_INCLUDE += -I$(RTL_DIR)/tcu/dpi
+	endif
+endif
+
+# Add DXA extension sources
+ifneq (,$(filter -DVX_CFG_EXT_DXA_ENABLE, $(XCONFIGS)))
+	RTL_PKGS += $(RTL_DIR)/dxa/VX_dxa_pkg.sv
+	RTL_INCLUDE += -I$(RTL_DIR)/dxa
+endif
+
+# Add TEX extension sources
+ifneq (,$(filter -DVX_CFG_EXT_TEX_ENABLE, $(XCONFIGS)))
+	RTL_PKGS += $(RTL_DIR)/tex/VX_tex_pkg.sv
+	RTL_INCLUDE += -I$(RTL_DIR)/tex
+endif
+
+# Add RASTER extension sources
+ifneq (,$(filter -DVX_CFG_EXT_RASTER_ENABLE, $(XCONFIGS)))
+	RTL_PKGS += $(RTL_DIR)/raster/VX_raster_pkg.sv
+	RTL_INCLUDE += -I$(RTL_DIR)/raster
+endif
+
+# Add OM extension sources
+ifneq (,$(filter -DVX_CFG_EXT_OM_ENABLE, $(XCONFIGS)))
+	RTL_PKGS += $(RTL_DIR)/om/VX_om_pkg.sv
+	RTL_INCLUDE += -I$(RTL_DIR)/om
+endif
+
+# Add RTU extension sources
+ifneq (,$(filter -DVX_CFG_EXT_RTU_ENABLE, $(XCONFIGS)))
+	RTL_PKGS += $(RTL_DIR)/rtu/VX_rtu_pkg.sv
+	RTL_INCLUDE += -I$(RTL_DIR)/rtu
+endif
+
+# Add MUFU extension sources
+ifneq (,$(filter -DVX_CFG_EXT_MUFU_ENABLE, $(XCONFIGS)))
+	RTL_INCLUDE += -I$(RTL_DIR)/mufu
+endif
+
+RTL_PKGS += $(RTL_DIR)/VX_trace_pkg.sv
+
+# Command Processor: declare the package only. Interfaces live in
+# filename-matching files (VX_cp_engine_bid_if.sv, VX_cp_gpu_if.sv,
+# VX_cp_axi_m_if.sv, VX_cp_axil_s_if.sv) and are auto-discovered by
+# Verilator from the -I path above.
+RTL_PKGS += $(RTL_DIR)/cp/VX_cp_pkg.sv
+
+TOP = vortex_afu_shim
+
+VL_FLAGS += --language 1800-2012 --assert -Wall -Wpedantic
+VL_FLAGS += -Wno-DECLFILENAME -Wno-REDEFMACRO
+VL_FLAGS += --x-initial unique --x-assign unique
+VL_FLAGS += verilator.vlt
+VL_FLAGS += -DVX_CFG_XLEN=$(XLEN) -DVX_CFG_XLEN_$(XLEN)
+# Scalar config values come from the included VX_config.vh; passing the full
+# resolved XCONFIGS here would fight the header and break parameter constancy.
+# Raw $(CONFIGS) carries only the enum *value* (e.g. VX_CFG_TCU_TYPE=DPI), which
+# leaves the RTL `ifdef selectors (which key off the *companion*
+# VX_CFG_TCU_TYPE_DPI) unmatched. Add just the enum companions gen_config
+# resolves, so a CONFIGS enum override actually selects its RTL implementation.
+VL_FLAGS += $(CONFIGS) $(filter -DVX_CFG_TCU_TYPE_% -DVX_CFG_FPU_TYPE_%,$(XCONFIGS))
+VL_FLAGS += $(RTL_INCLUDE)
+VL_FLAGS += $(RTL_PKGS)
+
+# Extract RTL directories from include directories
+RTL_DIRS := $(patsubst -I%,%,$(filter -I%,$(RTL_INCLUDE)))
+
+# Discover RTL source files from source directories
+RTL_SRCS := $(shell find $(RTL_DIRS) -type f \( -name '*.v' -o -name '*.vh' -o -name '*.sv' \))
+
+# Enable Verilator multithreaded simulation
+THREADS ?= $(shell python3 -c 'import multiprocessing as mp; print(mp.cpu_count())')
+VL_FLAGS += -j $(THREADS)
+#VL_FLAGS += --threads $(THREADS)
+
+# Debugging
+ifdef DEBUG
+	VL_FLAGS += $(DBG_FLAGS)
+	CXXFLAGS += -g -O0 $(DBG_FLAGS)
+else
+	VL_FLAGS += -DNDEBUG
+	CXXFLAGS += -O2 -DNDEBUG
+endif
+
+# Enable scope analyzer
+ifdef SCOPE
+	VL_FLAGS += -DSCOPE $(DBG_SCOPE_FLAGS)
+	CXXFLAGS += -DSCOPE
+	SCOPE_JSON = $(DESTDIR)/scope.json
+endif
+
+# Enable perf counters
+ifdef PERF
+	VL_FLAGS += -DPERF_ENABLE
+	CXXFLAGS += -DPERF_ENABLE
+endif
+
+# Enable VCD waveform
+ifdef VCD
+	VL_FLAGS += --trace --trace-structs
+	CXXFLAGS += -DVCD_OUTPUT
+endif
+
+# Enable SAIF tracing
+ifdef SAIF
+	VL_FLAGS += --trace-saif
+	CXXFLAGS += -DSAIF_OUTPUT
+endif
+
+# use our XRT shim
+VL_FLAGS += -DNOXRT
+CXXFLAGS += -DNOXRT
+
+PROJECT := libxrtsim.so
+
+.PHONY: all force clean
+
+all: $(DESTDIR)/$(PROJECT)
+
+$(DESTDIR)/vortex.json: $(CONFIG_FILE)
+	$(VERILATOR_PATH)/bin/verilator --json-only -O0 $(VL_FLAGS) $(TOP) --json-only-output $@
+
+$(DESTDIR)/scope.json: $(DESTDIR)/vortex.json
+	$(SCRIPT_DIR)/scope.py $^ -o $@
+
+# verilator --build runs its own make (parallelized by -j in VL_FLAGS) that
+# cannot reach this make's jobserver, so it gets a clean MAKEFLAGS.
+$(DESTDIR)/$(PROJECT): $(SRCS) $(SCOPE_JSON) $(CONFIG_FILE) $(RTL_SRCS)
+	MAKEFLAGS= $(VERILATOR_PATH)/bin/verilator --build --exe $(VL_FLAGS) --cc $(TOP) --top-module $(TOP) $(SRCS) -CFLAGS '$(CXXFLAGS)' -LDFLAGS '$(LDFLAGS)' --Mdir $@.obj_dir -o $@
+
+# updates the timestamp when flags changed.
+$(CONFIG_FILE): force
+	@mkdir -p $(@D)
+	@printf '%s\n' "$(VL_FLAGS)" "$(CXXFLAGS)" > $@.tmp
+	@if ! cmp -s $@.tmp $@; then \
+	  mv $@.tmp $@; \
+	  rm -rf $(DESTDIR)/$(PROJECT).obj_dir; \
+	else \
+	  rm $@.tmp; \
+	fi
+
+clean:
+	rm -rf $(DESTDIR)/$(PROJECT).obj_dir
+	rm -f $(DESTDIR)/vortex.json $(DESTDIR)/scope.json $(DESTDIR)/$(PROJECT)
