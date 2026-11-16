@@ -1,3 +1,46 @@
+# GhOST on Vortex SIMX (CSE 254A Project)
+
+This repository extends the [Vortex GPGPU](https://github.com/vortexgpgpu/vortex) C++ cycle-level simulator (**SIMX**) to explore **GhOST** (GPU out-of-order scheduling) at the per-warp issue boundary.
+
+> **Working Reference & Architecture Notes:** See [`z_ghost_project_notes/simx_foundation/GHOST_SIMX_GUIDE.md`](z_ghost_project_notes/simx_foundation/GHOST_SIMX_GUIDE.md) and [`docs/proposals/ghost_simx_foundation_proposal.md`](docs/proposals/ghost_simx_foundation_proposal.md) for full pipeline diagrams, trace semantics, and implementation details.
+
+---
+
+## Current Project Status (Checkpoint)
+
+- **SIMX Foundation & Observability (Complete):** Implemented the opt-in `SIMX_GHOST_PASSTHROUGH` insertion boundary inside `Core::Impl::issue()` (`sim/simx/core.cpp`) and added the three modular GhOST pipeline shells (`GhostDependenceChecker`, `GhostIssueBuffer`, `GhostScheduler`) in `sim/simx/ghost.h`.
+- **Issue-Candidate Tracing & Regression Suite (Complete):** Added `pipeline issue-candidate` debug tracing at `--debug=3`, a standalone `ghost` regression test (`tests/regression/ghost/`) containing independent and dependent integer ALU chains, and `ci/trace_order.py` to parse candidate vs. accepted issue order into CSVs.
+- **Next Steps (In Progress):** Implement intra-warp RAW/WAR/WAW dependence tracking in `GhostDependenceChecker`, multi-entry buffering in `GhostIssueBuffer`, and age-ordered ready instruction selection in `GhostScheduler`, then validate out-of-order issue acceleration on SIMX.
+
+---
+
+## Key Added & Modified Files
+
+| Path | Description |
+| :--- | :--- |
+| `sim/simx/ghost.h` | Defines `GhostDependenceChecker`, `GhostIssueBuffer`, `GhostScheduler`, and `GhostPipeline` (currently pass-through shells). |
+| `sim/simx/core.cpp` | Hooks the GhOST pipeline at the per-warp I-buffer head under `SIMX_GHOST_PASSTHROUGH` and logs `issue-candidate` events. |
+| `tests/regression/ghost/` | Standalone SIMX regression kernel (`kernel.cpp`, `main.cpp`, `common.h`, `Makefile`) testing dependent vs. independent ALU chains. |
+| `tests/regression/Makefile` | Registers the `ghost` target for SIMX regression runs. |
+| `ci/trace_order.py` | Parses SIMX `--debug=3` logs into CSV rows (`cycle,event,core,cid,wid,pc,uuid,opcode`). |
+| `z_ghost_project_notes/` | Design guide, SIMX pipeline mapping, and checkpoint notes. |
+
+---
+
+## Quick Validation Instructions (SIMX)
+
+Assuming the Vortex toolchain is installed (e.g., at `$HOME/tools`), configure an out-of-tree `XLEN=32` build from the repository root:
+
+```bash
+mkdir -p build && cd build
+../configure --xlen=32 --tooldir="$HOME/tools"
+make -C tests/regression/ghost -j$(nproc)
+
+
+-----------------------------------------------------------------------
+
+
+
 <p align="center">
   <img src="docs/assets/img/vortex_framework_stack.svg" alt="Vortex framework stack" width="100%">
 </p>
