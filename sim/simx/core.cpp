@@ -591,7 +591,40 @@ public:
 
         auto trace = ibuffer->peek();
       #ifdef SIMX_GHOST_PASSTHROUGH
-        trace = ghost_pipeline_.pass_through(trace);
+        GhostPipelineInput ghost_input;
+        auto& ports = ghost_input.ports;
+        auto& entry = ports.incoming;
+        entry.valid = true;
+        entry.warp_id = trace->wid;
+        entry.uuid = trace->uuid;
+        entry.pc = trace->PC;
+        entry.instruction_bits = trace->code;
+        entry.mask = trace->tmask;
+        entry.trace = trace;
+        entry.decoded_instruction = trace->instr_ptr;
+        entry.dst_reg = trace->dst_reg;
+        entry.writeback = trace->wb;
+        entry.fcsr_read_mask = trace->instr_ptr->fcsr_reads();
+        entry.fcsr_write_mask = trace->instr_ptr->fcsr_writes();
+        entry.instruction_class.fu_type = trace->fu_type;
+        entry.instruction_class.op_type = trace->op_type;
+        for (uint32_t i = 0; i < NUM_SRC_REGS; ++i) {
+          entry.src_regs.at(i) = trace->src_regs.at(i);
+        }
+
+        ports.isb.warp_id = trace->wid;
+        ports.warp_control.warp_id = trace->wid;
+        ports.warp_control.mask_valid = true;
+        ports.warp_control.mask = trace->tmask;
+        ports.decode_scheduler.valid = true;
+        ports.decode_scheduler.warp_id = trace->wid;
+        ports.dc_to_isb_valid = entry.valid;
+        auto& current_candidate = ports.itab.candidates.at(0);
+        current_candidate.valid = entry.valid;
+        current_candidate.entry = entry;
+
+        auto ghost_output = ghost_pipeline_.pass_through(ghost_input);
+        trace = ghost_output.ports.itab.candidates.at(0).entry.trace;
       #endif
 
         // check scoreboard against sequencer micro-op (handles uop WAW/RAW)
@@ -678,6 +711,13 @@ public:
           staged_since_.at(wid) = std::max(last_issue_.at(wid), trace->ibuf_time) + 1;
           last_issue_.at(wid) = SimPlatform::instance().cycles();
           DT(3, simobject_->name() << "-pipeline issue: " << *uop_trace);
+        #ifdef SIMX_GHOST_PASSTHROUGH
+          GhostIssueUpdate issue_update;
+          issue_update.valid = true;
+          issue_update.warp_id = uop_trace->wid;
+          issue_update.trace = uop_trace;
+          ghost_pipeline_.pass_through_issue_update(issue_update);
+        #endif
           if (uop_trace->wb) {
             // update scoreboard
             scoreboard_->reserve(uop_trace);
@@ -860,10 +900,26 @@ public:
         operands_.at(iw)->writeback(trace);
         if (scoreboard_->commit_packet(trace)) {
           scoreboard_->release(trace);
+        #ifdef SIMX_GHOST_PASSTHROUGH
+          GhostWritebackUpdate writeback_update;
+          writeback_update.valid = true;
+          writeback_update.warp_id = trace->wid;
+          writeback_update.dst_reg = trace->dst_reg;
+          writeback_update.trace = trace;
+          ghost_pipeline_.pass_through_writeback(writeback_update);
+        #endif
         }
       }
       if (trace->eop && trace->instr_ptr->fcsr_writes()) {
         scoreboard_->release_fcsr(trace);
+      #ifdef SIMX_GHOST_PASSTHROUGH
+        GhostWritebackUpdate writeback_update;
+        writeback_update.valid = true;
+        writeback_update.warp_id = trace->wid;
+        writeback_update.fcsr_mask = trace->instr_ptr->fcsr_writes();
+        writeback_update.trace = trace;
+        ghost_pipeline_.pass_through_writeback(writeback_update);
+      #endif
       }
 
       if (trace->eop) {

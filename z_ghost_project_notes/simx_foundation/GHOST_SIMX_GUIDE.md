@@ -7,11 +7,11 @@ test workload.
 
 ## Status at a glance
 
-**Current state: foundation and observability only.** The three GhOST C++
-shells pass each instruction trace through unchanged. They do not calculate
-dependencies, buffer extra instructions, choose ready instructions, or reorder
-issue. The intent is to provide a safe insertion point and comparable traces
-before implementing the scheduling algorithm.
+**Current state: typed SIMX pass-through foundation and observability only.**
+The three GhOST C++ shells pass paper-shaped input/output records through
+unchanged. They do not calculate dependencies, buffer extra instructions,
+choose ready instructions, or reorder issue. The intent is to establish the
+interfaces and insertion point before implementing the scheduling algorithm.
 
 The test workload verifies the result of a small integer instruction sequence.
 With debug tracing enabled, a CSV utility records both issue candidates and
@@ -24,8 +24,8 @@ part of this foundation.
 
 | File | Purpose |
 |---|---|
-| `sim/simx/core.cpp` | Under `SIMX_GHOST_PASSTHROUGH`, sends the per-warp I-buffer head through the GhOST pass-through pipeline. Adds an `issue-candidate` trace after the existing scoreboard, issue-lock, and functional-unit readiness checks. Existing `pipeline issue` remains the accepted-issue event. |
-| `sim/simx/ghost.h` | Defines the three pass-through shells: `GhostDependenceChecker`, `GhostIssueBuffer`, and `GhostScheduler`, composed by `GhostPipeline`. Each shell has a TODO for its eventual responsibility and returns the same trace pointer. |
+| `sim/simx/core.cpp` | Under `SIMX_GHOST_PASSTHROUGH`, maps the per-warp I-buffer head and available decoded metadata into typed GhOST records. Accepted issue and scoreboard/FCSR release events pass through typed feedback records. Adds an `issue-candidate` trace after the existing readiness checks. |
+| `sim/simx/ghost.h` | Defines paper-shaped instruction, IsB, scoreboard, warp-control, location-pointer, ITab, issue, and writeback records, plus typed input/output records for `GhostDependenceChecker`, `GhostIssueBuffer`, and `GhostScheduler`. The shells copy all fields unchanged. |
 | `tests/regression/ghost/Makefile` | Adds the standalone `ghost` regression application and selects the `vortex2` kernel startup library. |
 | `tests/regression/ghost/kernel.cpp` | Contains a deliberate integer ALU instruction sequence with independent and dependent operations, followed by a result store. |
 | `tests/regression/ghost/main.cpp` | Builds and launches the kernel, reads back one value per hardware thread, and checks every result is 16. |
@@ -140,21 +140,46 @@ per-warp I-buffer head
   -> Operands and the unchanged downstream pipeline
 ```
 
-With the build define `SIMX_GHOST_PASSTHROUGH`, the I-buffer trace pointer is
-passed through all three shell calls. No state is stored in the shells; no
-trace ownership or retirement changes. The Sequencer and all issue checks
-still receive the original trace.
+With the build define `SIMX_GHOST_PASSTHROUGH`, the I-buffer head and its
+available decode metadata are copied into a `GhostPipelinePorts` record and
+passed through all three shell calls. In this temporary path, candidate slot
+zero carries the same trace pointer so the existing Sequencer still receives
+the original instruction. No state is stored in the shells; no trace ownership
+or retirement changes.
+
+The typed record makes data available to future modules without pretending
+SIMX already has GhOST state:
+
+- **Mapped from SIMX:** validity, warp ID, UUID, PC, instruction bits, thread
+  mask, trace and decoded-instruction pointers, source/destination registers,
+  FU/op type, writeback indication, and decoded FCSR read/write masks.
+- **Present but not populated by this foundation:** IsB entries/full/free
+  locations, dependency vector and age/index, scoreboard readiness and
+  dependencies, instruction-class flags not represented explicitly by current
+  decode metadata, scheduler wakeup vectors, location-pointer state, ITab
+  occupancy, branch/synchronization controls, and decode `idx_val`. Optional
+  values remain unset rather than being guessed.
+- **Feedback records:** accepted issue is forwarded after `Operands` accepts
+  the micro-op; scoreboard destination and FCSR releases are forwarded at
+  their existing release points. The existing SIMX scoreboard is not replaced
+  or modified.
+
+These are synchronous record copies, not new `SimObject`s or `SimChannel`s.
+The existing per-cycle schedule and latency are unchanged. The feedback
+methods currently have no state-changing effect.
 
 | Shell | Intended future job | Current behavior |
 |---|---|---|
-| `GhostDependenceChecker` | Compare an incoming instruction's register and instruction class metadata against older not-yet-issued instructions; attach dependency/ordering metadata. | Returns the input trace pointer unchanged. |
-| `GhostIssueBuffer` | Hold multiple decoded instructions per warp, record age and dependency state, and update state when issue/writeback events occur. | Returns the input trace pointer unchanged; it is not a buffer yet. |
-| `GhostScheduler` | Select eligible older-ready instructions from the issue buffer and offer per-warp candidates to the existing issue path. | Returns the input trace pointer unchanged; it does not select or reorder. |
+| `GhostDependenceChecker` | Compare an incoming instruction's register and instruction-class metadata against older not-yet-issued instructions; attach dependency/ordering metadata. | Copies the typed port record unchanged. |
+| `GhostIssueBuffer` | Hold multiple decoded instructions per warp, record age and dependency state, and update state when issue/writeback events occur. | Copies the typed port record and feedback records unchanged; it is not a buffer yet. |
+| `GhostScheduler` | Select eligible older-ready entries from the issue buffer and offer per-warp candidates to the existing issue path. | Copies the typed port record and feedback records unchanged; it does not select or reorder. |
 
 The existing Scoreboard remains responsible for hazards from already-issued
 instructions. The existing arbiter, issue locks, FU credits, operand capture,
 functional units, commit, and scoreboard release remain unchanged. The define
-does not enable any GhOST behavior in RTL or another backend.
+does not enable any GhOST behavior in RTL or another backend. `GhostIssueUpdate`
+currently identifies the accepted sequencer micro-op; its optional IsB bank
+and index are unset because the current path has no IsB location.
 
 ## Issue trace meanings
 
@@ -408,18 +433,18 @@ These are **future work**. They are not implemented by the current shells.
 
 ## Current verification record
 
-The foundation was built and run in the configured XLEN=32 build:
+The typed-record foundation was verified in the configured XLEN=32 build:
 
-- `make -C build/tests/regression/ghost clean && make -C build/tests/regression/ghost -j2`
-- `cd build && ./ci/blackbox.sh --driver=simx --app=ghost --debug=3 --log=ghost.log`
-- Same command with `CONFIGS="-DSIMX_GHOST_PASSTHROUGH"` and a distinct log
-  file.
-- `python3 ci/trace_order.py ...` parsed both logs; their CSVs compared equal.
-- Both runs printed `PASSED!`; the explicit ALU sequence remained
-  `ADDI -> ADD -> ADDI -> ADD -> ADD`.
-- A synthetic event-log smoke test confirmed that the parser reports
-  candidate and accepted events separately.
+- Built the default SIMX runtime with `make -C sw/runtime/simx -j2` from
+  `build/`.
+- Ran the `ghost` regression once without the define and once with
+  `CONFIGS="-DSIMX_GHOST_PASSTHROUGH"`; both logs contained `PASSED!`.
+- Parsed both debug logs with `python3 ci/trace_order.py`; the baseline and
+  pass-through CSV files compared equal with `diff -u`.
 - `git diff --check` passed.
+
+A synthetic event-log smoke test previously confirmed that the parser reports
+candidate and accepted events separately.
 
 These checks validate pass-through compatibility and the trace tool. They do
 **not** validate out-of-order scheduling, since that has intentionally not
