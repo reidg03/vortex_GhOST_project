@@ -2,6 +2,7 @@
 #define _COMMON_H_
 
 typedef struct {
+  uint64_t src_addr;
   uint64_t dst_addr;
 } kernel_arg_t;
 

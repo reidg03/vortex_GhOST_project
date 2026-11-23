@@ -2,15 +2,17 @@
 
 This repository extends the [Vortex GPGPU](https://github.com/vortexgpgpu/vortex) C++ cycle-level simulator (**SIMX**) to explore **GhOST** (GPU out-of-order scheduling) at the per-warp issue boundary.
 
-> **Working Reference & Architecture Notes:** See [`z_ghost_project_notes/simx_foundation/GHOST_SIMX_GUIDE.md`](z_ghost_project_notes/simx_foundation/GHOST_SIMX_GUIDE.md) and [`docs/proposals/ghost_simx_foundation_proposal.md`](docs/proposals/ghost_simx_foundation_proposal.md) for full pipeline diagrams, trace semantics, and implementation details.
+> **Working Reference & Architecture Notes:** See [`z_ghost_project_notes/simx_foundation/GHOST_SIMX_GUIDE.md`](z_ghost_project_notes/simx_foundation/GHOST_SIMX_GUIDE.md) for the current pipeline mapping, stage contracts, limits, and test/trace commands. The proposal in [`docs/proposals/ghost_simx_foundation_proposal.md`](docs/proposals/ghost_simx_foundation_proposal.md) records the original foundation design.
 
 ---
 
-## Current Project Status (Checkpoint)
+## Current Project Status
 
-- **SIMX Foundation & Observability (Complete):** Implemented the opt-in `SIMX_GHOST_PASSTHROUGH` insertion boundary inside `Core::Impl::issue()` (`sim/simx/core.cpp`) and added the three modular GhOST pipeline shells (`GhostDependenceChecker`, `GhostIssueBuffer`, `GhostScheduler`) in `sim/simx/ghost.h`.
-- **Issue-Candidate Tracing & Regression Suite (Complete):** Added `pipeline issue-candidate` debug tracing at `--debug=3`, a standalone `ghost` regression test (`tests/regression/ghost/`) containing independent and dependent integer ALU chains, and `ci/trace_order.py` to parse candidate vs. accepted issue order into CSVs.
-- **Next Steps (In Progress):** Implement intra-warp RAW/WAR/WAW dependence tracking in `GhostDependenceChecker`, multi-entry buffering in `GhostIssueBuffer`, and age-ordered ready instruction selection in `GhostScheduler`, then validate out-of-order issue acceleration on SIMX.
+- **Stateful SIMX-only prototype:** `SIMX_GHOST_ENABLE` inserts GhOST DC, IsB, and Scheduler/ITab between decoded I-buffer entries and existing issue arbitration.
+- **Dependency and ordering logic:** Tracks intra-IsB register dependencies and scoreboard hazards; permits load/load reordering, preserves conflicting memory order through completion, and holds branches/synchronization/unsupported classes conservatively.
+- **Configurable storage:** Defaults to 8 IsB entries and 2 ITab candidates per warp; override with `SIMX_GHOST_ISB_SIZE` and `SIMX_GHOST_ITAB_SIZE`.
+- **Observable issue order:** At `--debug=3`, candidate and accepted issue events can be exported to CSV with `ci/trace_order.py`. The `ghost` regression verifies a load-dependent result and exhibits legal independent-instruction overtaking.
+- **Scope and maturity:** SIMX only; this is a prototype, not a claim of full paper-equivalent behavior. See the working guide for limitations and remaining validation.
 
 ---
 
@@ -18,9 +20,10 @@ This repository extends the [Vortex GPGPU](https://github.com/vortexgpgpu/vortex
 
 | Path | Description |
 | :--- | :--- |
-| `sim/simx/ghost.h` | Defines `GhostDependenceChecker`, `GhostIssueBuffer`, `GhostScheduler`, and `GhostPipeline` (currently pass-through shells). |
-| `sim/simx/core.cpp` | Hooks the GhOST pipeline at the per-warp I-buffer head under `SIMX_GHOST_PASSTHROUGH` and logs `issue-candidate` events. |
-| `tests/regression/ghost/` | Standalone SIMX regression kernel (`kernel.cpp`, `main.cpp`, `common.h`, `Makefile`) testing dependent vs. independent ALU chains. |
+| `sim/simx/ghost.h` | Defines the GhOST instruction/dependency records, dependence checker, per-warp IsB, scheduler/ITab, and pipeline coordinator. |
+| `sim/simx/core.cpp` | Connects GhOST candidates to the existing sequencer, scoreboard, structural checks, and issue arbiter; logs candidate and accepted issue events. |
+| `sim/simx/sequencer.cpp` | Keeps OoO-selected simple traces independent; continues caching sequencer-generated macro-op micro-ops. |
+| `tests/regression/ghost/` | SIMX regression covering load-RAW, register-WAR/WAW, independent-instruction overtaking, and result correctness. |
 | `tests/regression/Makefile` | Registers the `ghost` target for SIMX regression runs. |
 | `ci/trace_order.py` | Parses SIMX `--debug=3` logs into CSV rows (`cycle,event,core,cid,wid,pc,uuid,opcode`). |
 | `z_ghost_project_notes/` | Design guide, SIMX pipeline mapping, and checkpoint notes. |
@@ -34,7 +37,18 @@ Assuming the Vortex toolchain is installed (e.g., at `$HOME/tools`), configure a
 ```bash
 mkdir -p build && cd build
 ../configure --xlen=32 --tooldir="$HOME/tools"
-make -C tests/regression/ghost -j$(nproc)
+CONFIGS="-DSIMX_GHOST_ENABLE" ./ci/blackbox.sh --driver=simx --app=ghost
+CONFIGS="-DSIMX_GHOST_ENABLE" ./ci/blackbox.sh \
+  --driver=simx --app=ghost --debug=3 --log=ghost.log
+python3 ci/trace_order.py ghost.log > ghost_issue_order.csv
+grep -E ',(LW|ADDI|ADD)$' ghost_issue_order.csv
+```
+
+Default capacities are 8 IsB entries and 2 ITab candidates per warp. To
+override them, pass `-DSIMX_GHOST_ISB_SIZE=<n>` and
+`-DSIMX_GHOST_ITAB_SIZE=<n>` in `CONFIGS`; ITab capacity must not exceed IsB
+capacity. The full guide linked above covers baseline comparison, expected
+trace order, and regression commands.
 
 
 -----------------------------------------------------------------------

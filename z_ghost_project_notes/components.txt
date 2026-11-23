@@ -1,4 +1,6 @@
 NOT ENTIRELY CORRECT, JUST A REFERENCE
+Historical paper-oriented checklist only. For implemented SIMX behavior,
+configuration, and remaining work, use simx_foundation/GHOST_SIMX_GUIDE.md.
 
 ================================================================================
 GHOST COMPONENT & IMPLEMENTATION CHECKLIST

@@ -18,6 +18,7 @@
 int main() {
   vx_device_h device = nullptr;
   vx_queue_h queue = nullptr;
+  vx_buffer_h src_buffer = nullptr;
   vx_buffer_h dst_buffer = nullptr;
   vx_module_h module = nullptr;
   vx_kernel_h kernel = nullptr;
@@ -32,11 +33,16 @@ int main() {
   uint64_t num_threads = 0;
   CHECK(vx_device_query(device, VX_CAPS_NUM_THREADS, &num_threads));
   const uint64_t buffer_size = num_threads * sizeof(uint32_t);
+  std::vector<uint32_t> inputs(num_threads, 50);
   std::vector<uint32_t> results(num_threads, 0);
 
+  CHECK(vx_buffer_create(device, buffer_size, VX_MEM_READ, &src_buffer));
   CHECK(vx_buffer_create(device, buffer_size, VX_MEM_WRITE, &dst_buffer));
   kernel_arg_t kernel_arg{};
+  CHECK(vx_buffer_address(src_buffer, &kernel_arg.src_addr));
   CHECK(vx_buffer_address(dst_buffer, &kernel_arg.dst_addr));
+  CHECK(vx_enqueue_write(queue, src_buffer, 0, inputs.data(), buffer_size,
+                         0, nullptr, nullptr));
 
   CHECK(vx_module_load_file(device, "kernel.vxbin", &module));
   CHECK(vx_module_get_kernel(module, "main", &kernel));
@@ -57,8 +63,8 @@ int main() {
 
   int errors = 0;
   for (uint32_t tid = 0; tid < num_threads; ++tid) {
-    if (results[tid] != 16) {
-      std::fprintf(stderr, "thread %u: expected 16, got %u\n", tid, results[tid]);
+    if (results[tid] != 62) {
+      std::fprintf(stderr, "thread %u: expected 62, got %u\n", tid, results[tid]);
       ++errors;
     }
   }
@@ -68,6 +74,7 @@ int main() {
   vx_kernel_release(kernel);
   vx_module_release(module);
   vx_buffer_release(dst_buffer);
+  vx_buffer_release(src_buffer);
   vx_queue_release(queue);
   vx_device_release(device);
 

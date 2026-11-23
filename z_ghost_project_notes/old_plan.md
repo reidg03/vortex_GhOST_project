@@ -1,5 +1,9 @@
 # GhOST-on-SimX Foundation Plan
 
+> Historical plan for the original pass-through/ALU-only foundation. It is
+> superseded by the current implementation and validation notes in
+> [simx_foundation/GHOST_SIMX_GUIDE.md](simx_foundation/GHOST_SIMX_GUIDE.md).
+
 ## Problem and approach
 
 Establish the SIMX pipeline and GhOST insertion point, make candidate-vs-accepted issue order observable, and then build an opt-in SIMX-only GhOST prototype. The first prototype will reorder simple integer ALU instructions only; memory, branches, barriers, and other special or side-effecting instructions stay on a conservative in-order path. No RTL, runtime, or non-SIMX behavior is in scope.

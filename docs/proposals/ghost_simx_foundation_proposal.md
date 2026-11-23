@@ -1,5 +1,11 @@
 # GhOST on SIMX: Foundation
 
+> **Status:** This proposal describes the original pass-through foundation and
+> is retained as design history. The current stateful SIMX prototype uses
+> `SIMX_GHOST_ENABLE`; see
+> [`z_ghost_project_notes/simx_foundation/GHOST_SIMX_GUIDE.md`](../../z_ghost_project_notes/simx_foundation/GHOST_SIMX_GUIDE.md)
+> for implementation behavior, commands, and remaining limitations.
+
 ## Goal
 
 Provide a low-risk place to learn and measure instruction issue order before implementing any GhOST scheduling behavior. This foundation is SIMX-only and must preserve the baseline order and results.
@@ -29,18 +35,10 @@ At this stage each shell returns its input trace unchanged. There is no dependen
 
 Future design work must settle buffer sizing, trace lifetime/ownership, register and memory ordering, control-flow/barrier rules, and interaction with the micro-op sequencer before adding GhOST behavior.
 
-## Baseline kernel and trace workflow
+## Historical baseline kernel and trace workflow
 
-The `tests/regression/ghost` kernel contains two independent integer operations separated by a dependent operation, followed by another dependent operation. Its output verifies the arithmetic while its disassembly/log exposes the instruction sequence.
-
-From a configured build directory:
-
-```bash
-./ci/blackbox.sh --driver=simx --app=ghost --debug=3 --log=ghost.log
-python3 ci/trace_order.py ghost.log > ghost_issue_order.csv
-
-CONFIGS="-DSIMX_GHOST_PASSTHROUGH" ./ci/blackbox.sh --driver=simx --app=ghost --debug=3 --log=ghost_passthrough.log
-python3 ci/trace_order.py ghost_passthrough.log > ghost_passthrough_issue_order.csv
-```
-
-The two issue CSVs should show the same ordering. A later scheduling implementation can use the same kernel and trace format to demonstrate a deliberate change while checking output and dependency correctness.
+The original pass-through phase used a kernel with independent and dependent
+integer operations and compared baseline issue traces against the shells. That
+phase has been superseded by the stateful scheduler. For current build,
+regression, capacity, and trace commands, use the
+[SIMX implementation guide](../../z_ghost_project_notes/simx_foundation/GHOST_SIMX_GUIDE.md).

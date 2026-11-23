@@ -125,8 +125,8 @@ instr_trace_t* Sequencer::get(instr_trace_t* trace) {
     return uop_trace;
   }
 
-  // Simple instruction — pass through
-  state_.current_uop = trace;
+  // Simple instructions are not cached: GhOST may select another entry while
+  // this instruction is waiting to issue.
   return trace;
 }
 

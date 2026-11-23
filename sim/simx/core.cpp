@@ -44,7 +44,7 @@
 #include "processor_impl.h"
 #include "kmu.h"
 #include "debug.h"
-#ifdef SIMX_GHOST_PASSTHROUGH
+#ifdef SIMX_GHOST_ENABLE
 #include "ghost.h"
 #endif
 #ifdef VX_CFG_EXT_TCU_ENABLE
@@ -335,6 +335,10 @@ public:
     pending_ifetches_ = 0;
 
     std::fill(ibuf_inflight_.begin(), ibuf_inflight_.end(), 0);
+  #ifdef SIMX_GHOST_ENABLE
+    ghost_pipeline_.reset();
+    ghost_dc_rr_ = 0;
+  #endif
 
     // perf_stats_ deliberately survives: these are the MPM counters, which are
     // free-running from device reset. A kernel launch re-enters reset() here but
@@ -583,53 +587,90 @@ public:
     for (uint32_t iw = 0; iw < VX_CFG_ISSUE_WIDTH; ++iw) {
       bool any_scrb_blocked = false;
       BitVector<> ready_set(PER_ISSUE_WARPS);
+    #ifdef SIMX_GHOST_ENABLE
+      std::vector<GhostItabCandidate> ghost_candidates(PER_ISSUE_WARPS);
+      std::vector<bool> ghost_from_ibuffer(PER_ISSUE_WARPS, false);
+    #endif
       for (uint32_t w = 0; w < PER_ISSUE_WARPS; ++w) {
         uint32_t wid = w * VX_CFG_ISSUE_WIDTH + iw;
         auto& ibuffer = ibuffers_.at(wid);
+        instr_trace_t* trace = nullptr;
+      #ifdef SIMX_GHOST_ENABLE
+        bool from_ibuffer = true;
+        auto isb = ghost_pipeline_.snapshot(wid);
+        std::array<bool, kGhostIsbBanks> scoreboard_ready{};
+        for (uint32_t bank = 0; bank < isb.entries.size(); ++bank) {
+          const auto& entry = isb.entries.at(bank);
+          if (!entry.valid)
+            continue;
+          std::array<bool, NUM_SRC_REGS> source_dependencies{};
+          auto uses = scoreboard_->get_uses(entry.trace);
+          for (uint32_t src = 0; src < NUM_SRC_REGS; ++src) {
+            const auto& source = entry.src_regs.at(src);
+            source_dependencies.at(src) = std::any_of(uses.begin(), uses.end(),
+              [&](const auto& use) {
+                return use.reg_type == source.type && use.reg_id == source.idx;
+              });
+          }
+          ghost_pipeline_.set_source_dependencies(wid, bank, source_dependencies);
+          scoreboard_ready.at(bank) = !scoreboard_->in_use(entry.trace);
+        }
+        auto itab = ghost_pipeline_.schedule(wid, scoreboard_ready);
+        bool has_itab_candidates = false;
+        auto candidate_seq = sequencers_.at(wid);
+        for (const auto& candidate : itab.candidates) {
+          if (!candidate.valid)
+            continue;
+          has_itab_candidates = true;
+          auto candidate_trace = candidate.entry.trace;
+          auto candidate_uop = candidate_seq->get(candidate_trace);
+          if (scoreboard_->in_use(candidate_uop)) {
+            any_scrb_blocked = true;
+            continue;
+          }
+          if (candidate_seq->starting()) {
+            auto ready = std::max(staged_since_.at(wid), candidate_trace->ibuf_time) + 2;
+            if (SimPlatform::instance().cycles() < ready)
+              continue;
+          }
+          auto lock_owner = issue_lock_owner_.at(iw);
+          if (lock_owner != kLockOpen && lock_owner != w)
+            continue;
+          auto fu = (int)candidate_uop->fu_type;
+          if (fu_full_seen_.at(iw).test(fu))
+            continue;
+
+          ghost_candidates.at(w) = candidate;
+          trace = candidate_trace;
+          from_ibuffer = false;
+          break;
+        }
+        if (!has_itab_candidates && !ibuffer->empty()
+         && !ghost_pipeline_.has_unissued(wid)) {
+          auto head = ibuffer->peek();
+          auto instruction_class = ghost_classify(*head);
+          if (instruction_class.is_ordered
+           && (instruction_class.is_barrier || ghost_pipeline_.empty(wid))) {
+            trace = head;
+          }
+        }
+        if (!trace)
+          continue;
+        ghost_from_ibuffer.at(w) = from_ibuffer;
+      #else
         if (ibuffer->empty())
           continue;
-
-        auto trace = ibuffer->peek();
-      #ifdef SIMX_GHOST_PASSTHROUGH
-        GhostPipelineInput ghost_input;
-        auto& ports = ghost_input.ports;
-        auto& entry = ports.incoming;
-        entry.valid = true;
-        entry.warp_id = trace->wid;
-        entry.uuid = trace->uuid;
-        entry.pc = trace->PC;
-        entry.instruction_bits = trace->code;
-        entry.mask = trace->tmask;
-        entry.trace = trace;
-        entry.decoded_instruction = trace->instr_ptr;
-        entry.dst_reg = trace->dst_reg;
-        entry.writeback = trace->wb;
-        entry.fcsr_read_mask = trace->instr_ptr->fcsr_reads();
-        entry.fcsr_write_mask = trace->instr_ptr->fcsr_writes();
-        entry.instruction_class.fu_type = trace->fu_type;
-        entry.instruction_class.op_type = trace->op_type;
-        for (uint32_t i = 0; i < NUM_SRC_REGS; ++i) {
-          entry.src_regs.at(i) = trace->src_regs.at(i);
-        }
-
-        ports.isb.warp_id = trace->wid;
-        ports.warp_control.warp_id = trace->wid;
-        ports.warp_control.mask_valid = true;
-        ports.warp_control.mask = trace->tmask;
-        ports.decode_scheduler.valid = true;
-        ports.decode_scheduler.warp_id = trace->wid;
-        ports.dc_to_isb_valid = entry.valid;
-        auto& current_candidate = ports.itab.candidates.at(0);
-        current_candidate.valid = entry.valid;
-        current_candidate.entry = entry;
-
-        auto ghost_output = ghost_pipeline_.pass_through(ghost_input);
-        trace = ghost_output.ports.itab.candidates.at(0).entry.trace;
+        trace = ibuffer->peek();
       #endif
 
         // check scoreboard against sequencer micro-op (handles uop WAW/RAW)
         auto seq = sequencers_.at(wid);
         auto uop_trace = seq->get(trace);  // returns cached uop or generates next
+      #ifdef SIMX_GHOST_ENABLE
+        if (!from_ibuffer && seq->starting()) {
+          ghost_pipeline_.pin(wid, ghost_candidates.at(w).bank_id);
+        }
+      #endif
 
         // The uop sequencer starts a macro-op once it reaches the front of the
         // buffer behind the staged instruction, and offers its first uop the
@@ -694,7 +735,22 @@ public:
         auto w = ibuffer_arbs_.at(iw).grant(ready_set);
         uint32_t wid = w * VX_CFG_ISSUE_WIDTH + iw;
         auto& ibuffer = ibuffers_.at(wid);
-        auto trace = ibuffer->peek();
+        instr_trace_t* trace;
+        bool from_ibuffer = true;
+      #ifdef SIMX_GHOST_ENABLE
+        uint32_t ghost_bank = 0;
+        if (!ghost_from_ibuffer.at(w)) {
+          const auto& candidate = ghost_candidates.at(w);
+          assert(candidate.valid);
+          trace = candidate.entry.trace;
+          ghost_bank = candidate.bank_id;
+          from_ibuffer = false;
+        } else {
+          trace = ibuffer->peek();
+        }
+      #else
+        trace = ibuffer->peek();
+      #endif
 
         // Retrieve the (already-generated) micro-op from the sequencer
         auto seq = sequencers_.at(wid);
@@ -711,13 +767,6 @@ public:
           staged_since_.at(wid) = std::max(last_issue_.at(wid), trace->ibuf_time) + 1;
           last_issue_.at(wid) = SimPlatform::instance().cycles();
           DT(3, simobject_->name() << "-pipeline issue: " << *uop_trace);
-        #ifdef SIMX_GHOST_PASSTHROUGH
-          GhostIssueUpdate issue_update;
-          issue_update.valid = true;
-          issue_update.warp_id = uop_trace->wid;
-          issue_update.trace = uop_trace;
-          ghost_pipeline_.pass_through_issue_update(issue_update);
-        #endif
           if (uop_trace->wb) {
             // update scoreboard
             scoreboard_->reserve(uop_trace);
@@ -737,7 +786,28 @@ public:
             }
           }
           // Advance sequencer; pop ibuffer only when all micro-ops issued
-          if (seq->advance()) {
+          bool sequence_complete = seq->advance();
+        #ifdef SIMX_GHOST_ENABLE
+          if (from_ibuffer && ghost_classify(*trace).is_ordered) {
+            if (!trace->instr_ptr->is_macro_op() || !sequence_complete) {
+              ghost_pipeline_.hold_ordered(wid, trace);
+            }
+          }
+          if (!from_ibuffer) {
+            GhostIssueUpdate issue_update;
+            issue_update.valid = true;
+            issue_update.warp_id = wid;
+            issue_update.bank_id = ghost_bank;
+            issue_update.instruction_complete = sequence_complete;
+            issue_update.trace = uop_trace;
+            ghost_pipeline_.issue(issue_update);
+          }
+          if (from_ibuffer && trace->instr_ptr->is_macro_op()
+           && sequence_complete && ghost_classify(*trace).is_ordered) {
+            ghost_pipeline_.complete(wid, trace);
+          }
+        #endif
+          if (sequence_complete) {
             if (trace->instr_ptr->is_macro_op()) {
               // A macro that stalled fetch at decode releases its warp once
               // its last micro-op issues.
@@ -750,19 +820,13 @@ public:
               trace->~instr_trace_t();
               trace_pool_.deallocate(trace, 1);
             }
-            ibuffer->pop();
-            // Release ibuffer backpressure slot (matches ++ in schedule()).
-            // Saturating decrement: flush_warp_pipeline only drains the
-            // ibuffer + resets ibuf_inflight to 0, but fetch_latch_ /
-            // decode-stage entries scheduled pre-trap can still arrive
-            // at issue() post-flush and decrement the (now-zeroed)
-            // counter. Async-trap users (RTU CB_YIELD path: AHS, CHS,
-            // MISS) routinely hit this; a non-saturating decrement
-            // underflows to UINT32_MAX and stalls scheduling. Proper
-            // fix is to extend flush_warp_pipeline to also drain
-            // fetch_latch_ + pending icache fetches for the warp.
-            if (ibuf_inflight_.at(wid) > 0) {
-              --ibuf_inflight_.at(wid);
+            if (from_ibuffer) {
+              ibuffer->pop();
+              // Saturate: a pre-trap fetch may be decoded after the flush
+              // reset the counter to zero.
+              if (ibuf_inflight_.at(wid) > 0) {
+                --ibuf_inflight_.at(wid);
+              }
             }
           }
         }
@@ -773,7 +837,59 @@ public:
         ++perf_stats_.scrb_stalls;
       }
     }
+  #ifdef SIMX_GHOST_ENABLE
+    ghost_admit_one();
+  #endif
   }
+
+  #ifdef SIMX_GHOST_ENABLE
+  void ghost_admit_one() {
+    for (uint32_t offset = 0; offset < VX_CFG_NUM_WARPS; ++offset) {
+      uint32_t wid = (ghost_dc_rr_ + offset) % VX_CFG_NUM_WARPS;
+      auto& ibuffer = ibuffers_.at(wid);
+      if (ibuffer->empty())
+        continue;
+
+      auto trace = ibuffer->peek();
+      auto entry = ghost_make_entry(trace);
+      if (!ghost_pipeline_.can_admit(wid, entry))
+        continue;
+
+      std::array<bool, NUM_SRC_REGS> source_dependencies{};
+      auto uses = scoreboard_->get_uses(trace);
+      for (uint32_t src = 0; src < NUM_SRC_REGS; ++src) {
+        const auto& source = entry.src_regs.at(src);
+        source_dependencies.at(src) = std::any_of(uses.begin(), uses.end(),
+          [&](const auto& use) {
+            return use.reg_type == source.type && use.reg_id == source.idx;
+          });
+      }
+
+      GhostPipelineInput input;
+      input.ports.incoming = entry;
+      input.ports.isb = ghost_pipeline_.snapshot(wid);
+      input.ports.warp_control.warp_id = wid;
+      input.ports.warp_control.mask = trace->tmask;
+      input.ports.warp_control.mask_valid = true;
+      input.ports.decode_scheduler.valid = true;
+      input.ports.decode_scheduler.warp_id = wid;
+      input.ports.location_pointer.full = input.ports.isb.full;
+      input.ports.location_pointer.free_locations = input.ports.isb.free_locations;
+      input.ports.dc_to_isb_valid = entry.valid;
+      input.source_dependencies = source_dependencies;
+      auto output = ghost_pipeline_.admit(input);
+      if (!output.accepted)
+        continue;
+
+      ibuffer->pop();
+      if (ibuf_inflight_.at(wid) > 0)
+        --ibuf_inflight_.at(wid);
+      ghost_dc_rr_ = (wid + 1) % VX_CFG_NUM_WARPS;
+      DT(3, simobject_->name() << "-ghost-admit: " << *trace);
+      return;
+    }
+  }
+  #endif
 
   void update_queue_full() {
     for (uint32_t iw = 0; iw < VX_CFG_ISSUE_WIDTH; ++iw) {
@@ -807,12 +923,18 @@ public:
     // scheduler observes the change the cycle after that.
     auto& branch_ctl = simobject_->branch_ctl_in;
     while (!branch_ctl.empty()) {
+    #ifdef SIMX_GHOST_ENABLE
+      ghost_pipeline_.resolve_branch(branch_ctl.peek());
+    #endif
       scheduler_->resume(branch_ctl.peek());
       branch_ctl.pop();
     }
     auto& warp_ctl = simobject_->warp_ctl_in;
     while (!warp_ctl.empty()) {
       auto& ctl = warp_ctl.peek();
+    #ifdef SIMX_GHOST_ENABLE
+      ghost_pipeline_.resolve_branch(ctl.wid);
+    #endif
       if (ctl.exit) {
         scheduler_->setTmask(ctl.wid, ThreadMask(VX_CFG_NUM_THREADS));
       } else {
@@ -900,31 +1022,34 @@ public:
         operands_.at(iw)->writeback(trace);
         if (scoreboard_->commit_packet(trace)) {
           scoreboard_->release(trace);
-        #ifdef SIMX_GHOST_PASSTHROUGH
+        #ifdef SIMX_GHOST_ENABLE
           GhostWritebackUpdate writeback_update;
           writeback_update.valid = true;
           writeback_update.warp_id = trace->wid;
           writeback_update.dst_reg = trace->dst_reg;
           writeback_update.trace = trace;
-          ghost_pipeline_.pass_through_writeback(writeback_update);
+          ghost_pipeline_.writeback(writeback_update);
         #endif
         }
       }
       if (trace->eop && trace->instr_ptr->fcsr_writes()) {
         scoreboard_->release_fcsr(trace);
-      #ifdef SIMX_GHOST_PASSTHROUGH
+      #ifdef SIMX_GHOST_ENABLE
         GhostWritebackUpdate writeback_update;
         writeback_update.valid = true;
         writeback_update.warp_id = trace->wid;
         writeback_update.fcsr_mask = trace->instr_ptr->fcsr_writes();
         writeback_update.trace = trace;
-        ghost_pipeline_.pass_through_writeback(writeback_update);
+        ghost_pipeline_.writeback(writeback_update);
       #endif
       }
 
       if (trace->eop) {
 
         // instruction mix profiling
+      #ifdef SIMX_GHOST_ENABLE
+        ghost_pipeline_.complete(trace->wid, trace);
+      #endif
         switch (trace->fu_type) {
         case FUType::ALU: ++perf_stats_.alu_instrs; break;
         case FUType::FPU: ++perf_stats_.fpu_instrs; break;
@@ -983,6 +1108,17 @@ public:
     auto& ibuffer = ibuffers_.at(wid);
     Word first_pc = 0;
     bool have_first = false;
+  #ifdef SIMX_GHOST_ENABLE
+    if (auto pc = ghost_pipeline_.oldest_pc(wid)) {
+      first_pc = *pc;
+      have_first = true;
+    }
+    for (auto trace : ghost_pipeline_.flush(wid)) {
+      pending_instrs_.remove(trace);
+      trace->~instr_trace_t();
+      trace_pool_.deallocate(trace, 1);
+    }
+  #endif
     while (!ibuffer->empty()) {
       auto trace = ibuffer->peek();
       if (!have_first) {
@@ -1148,8 +1284,9 @@ private:
   Scheduler::Ptr scheduler_;
 
   std::vector<TFifo<instr_trace_t*>::Ptr> ibuffers_;
-#ifdef SIMX_GHOST_PASSTHROUGH
+#ifdef SIMX_GHOST_ENABLE
   GhostPipeline ghost_pipeline_;
+  uint32_t ghost_dc_rr_ = 0;
 #endif
   Scoreboard::Ptr scoreboard_;
   std::vector<Operands::Ptr> operands_;

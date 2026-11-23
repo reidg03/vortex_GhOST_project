@@ -1,21 +1,21 @@
 # GhOST on Vortex SIMX — Foundation and Working Guide
 
-This is the working reference for the current GhOST-on-SIMX foundation:
-what is implemented, how SIMX moves instructions, where future GhOST logic
-belongs, what remains to be designed, and how to build, run, and inspect the
-test workload.
+This is the working reference for the SIMX-only GhOST prototype: what is
+implemented, how it fits the Vortex pipeline, its current conservative
+boundaries, and how to build, test, and inspect issue order.
 
 ## Status at a glance
 
-**Current state: typed SIMX pass-through foundation and observability only.**
-The three GhOST C++ shells pass paper-shaped input/output records through
-unchanged. They do not calculate dependencies, buffer extra instructions,
-choose ready instructions, or reorder issue. The intent is to establish the
-interfaces and insertion point before implementing the scheduling algorithm.
+**Current state: opt-in stateful SIMX scheduler, still under validation.**
+Build with `SIMX_GHOST_ENABLE` to use the dependence checker (DC), per-warp
+issue buffer (IsB), and age-ordered GhOST Scheduler/ITab before existing issue
+arbitration. The path tracks register dependencies, scoreboard hazards,
+conservative memory ordering, branch holds, and synchronization/unsupported
+instruction fallback. IsB and ITab capacities are compile-time configurable.
 
-The test workload verifies the result of a small integer instruction sequence.
-With debug tracing enabled, a CSV utility records both issue candidates and
-instructions accepted by the existing issue arbiter.
+The `ghost` regression verifies a load-dependent result and its debug trace
+demonstrates a younger independent instruction issuing before the dependent
+instruction. The default SIMX path remains available without the define.
 
 Scope is **SIMX only**. No RTL, runtime API, or other-driver GhOST changes are
 part of this foundation.
@@ -24,15 +24,15 @@ part of this foundation.
 
 | File | Purpose |
 |---|---|
-| `sim/simx/core.cpp` | Under `SIMX_GHOST_PASSTHROUGH`, maps the per-warp I-buffer head and available decoded metadata into typed GhOST records. Accepted issue and scoreboard/FCSR release events pass through typed feedback records. Adds an `issue-candidate` trace after the existing readiness checks. |
-| `sim/simx/ghost.h` | Defines paper-shaped instruction, IsB, scoreboard, warp-control, location-pointer, ITab, issue, and writeback records, plus typed input/output records for `GhostDependenceChecker`, `GhostIssueBuffer`, and `GhostScheduler`. The shells copy all fields unchanged. |
-| `tests/regression/ghost/Makefile` | Adds the standalone `ghost` regression application and selects the `vortex2` kernel startup library. |
-| `tests/regression/ghost/kernel.cpp` | Contains a deliberate integer ALU instruction sequence with independent and dependent operations, followed by a result store. |
-| `tests/regression/ghost/main.cpp` | Builds and launches the kernel, reads back one value per hardware thread, and checks every result is 16. |
+| `sim/simx/core.cpp` | Under `SIMX_GHOST_ENABLE`, admits decoded traces from each I-buffer into GhOST and feeds selected candidates through the existing sequencer, scoreboard, structural checks, and issue arbiter. Sends issue, writeback, completion, branch, and flush updates back to GhOST. |
+| `sim/simx/ghost.h` | Defines paper-shaped GhOST records and the stateful DC, IsB, Scheduler/ITab, plus the `GhostPipeline` coordinator. Defaults IsB to 8 entries/warp and ITab to 2 candidates/warp. |
+| `tests/regression/ghost/Makefile` | Builds the standalone `ghost` regression with explicit host/device dependencies on the shared argument header. |
+| `tests/regression/ghost/kernel.cpp` | Tests load RAW, register WAR/WAW ordering, independent-instruction overtaking, and final dependent result calculation. |
+| `tests/regression/ghost/main.cpp` | Initializes the input buffer, launches the kernel, and checks every thread's result is 62. |
 | `tests/regression/ghost/common.h` | Defines the device/host kernel argument structure. |
 | `tests/regression/Makefile` | Registers `ghost` in the regression list and excludes it from RTL/OPAE/XRT runs; it is intended for SIMX only. |
 | `ci/trace_order.py` | Parses SIMX debug logs and emits CSV rows for candidate and accepted issue events. |
-| `docs/proposals/ghost_simx_foundation_proposal.md` | Short design proposal describing the baseline insertion point and pass-through boundary. |
+| `docs/proposals/ghost_simx_foundation_proposal.md` | Historical foundation proposal; this guide documents the current stateful implementation. |
 
 This guide is the expanded, practical reference; the original paper text and
 component checklist remain in the parent notes folder. The checklist is a
@@ -90,8 +90,8 @@ Scheduler::schedule() (warp ID, PC, thread mask)
   -> I-cache request / response
   -> decode latch (instruction bits/code)
   -> Decoder (Instr + source/destination/FU/op metadata)
-  -> per-warp FIFO I-buffer (instr_trace_t*)
-  -> [future GhOST insertion point]
+  -> per-warp FIFO I-buffer
+  -> GhOST DC -> per-warp IsB -> GhOST Scheduler / ITab
   -> per-warp Sequencer (zero or more micro-ops)
   -> Scoreboard + issue locks + FU-credit checks
   -> ibuffer_arbs_ (grant one eligible warp per issue slice)
@@ -104,11 +104,17 @@ The fetch scheduler's input is a mask of warps that can fetch (for example,
 their I-buffer inflight slots are not saturated). It produces the next warp
 trace to fetch. It does **not** choose the decoded instruction that issues.
 
-The actual issue logic is in `Core::Impl::issue()`:
+The actual issue logic is in `Core::Impl::issue()`. With GhOST enabled, the
+DC admits at most one decoded I-buffer head per issue tick, round-robin across
+warps. The I-buffer retains ownership until admission succeeds; after that,
+the IsB owns the trace. The scheduler presents its oldest ready IsB entries;
+the core checks them oldest-first and offers the first structurally eligible
+one from that warp to arbitration. When GhOST is disabled, the legacy
+I-buffer-head path is used.
 
-- For each issue slice, it looks at the head of each assigned warp's FIFO
-  I-buffer.
-- It gets that trace's current micro-op from the warp's `Sequencer`.
+For either path, issue then:
+
+- Gets the selected trace's current micro-op from the warp's `Sequencer`.
 - It checks the existing scoreboard, sequencer startup timing, issue-lock
   ownership, functional-unit queue credits, and optional feature-specific
   structural constraints.
@@ -117,7 +123,9 @@ The actual issue logic is in `Core::Impl::issue()`:
 - If `Operands` accepts the micro-op, SIMX captures operands, records issue
   timing, reserves scoreboard state where needed, and emits the
   `pipeline issue` trace.
-- The I-buffer head is popped when its final micro-op issues.
+- An I-buffer trace is popped when its final micro-op issues. A GhOST entry is
+  consumed only after accepted issue; macro-op micro-ops remain pinned to their
+  IsB entry until the sequence finishes.
 
 Thus, GhOST belongs at the **issue-side input-selection boundary** in
 `Core::Impl::issue()`, after decode has populated the per-warp I-buffer and
@@ -125,7 +133,7 @@ before the existing per-warp sequencer / readiness and arbitration path.
 `Scheduler::schedule()` is the fetch-side scheduler and should not be changed
 to implement this issue scheduler.
 
-## Current GhOST shells and exact connections
+## GhOST stages and exact inputs/outputs
 
 The opt-in path is:
 
@@ -140,46 +148,38 @@ per-warp I-buffer head
   -> Operands and the unchanged downstream pipeline
 ```
 
-With the build define `SIMX_GHOST_PASSTHROUGH`, the I-buffer head and its
-available decode metadata are copied into a `GhostPipelinePorts` record and
-passed through all three shell calls. In this temporary path, candidate slot
-zero carries the same trace pointer so the existing Sequencer still receives
-the original instruction. No state is stored in the shells; no trace ownership
-or retirement changes.
+The three modules are plain SIMX C++ state/logic, not new `SimObject`s or
+`SimChannel`s. The build define affects SIMX only; RTL and other drivers do
+not include this path.
 
-The typed record makes data available to future modules without pretending
-SIMX already has GhOST state:
-
-- **Mapped from SIMX:** validity, warp ID, UUID, PC, instruction bits, thread
-  mask, trace and decoded-instruction pointers, source/destination registers,
-  FU/op type, writeback indication, and decoded FCSR read/write masks.
-- **Present but not populated by this foundation:** IsB entries/full/free
-  locations, dependency vector and age/index, scoreboard readiness and
-  dependencies, instruction-class flags not represented explicitly by current
-  decode metadata, scheduler wakeup vectors, location-pointer state, ITab
-  occupancy, branch/synchronization controls, and decode `idx_val`. Optional
-  values remain unset rather than being guessed.
-- **Feedback records:** accepted issue is forwarded after `Operands` accepts
-  the micro-op; scoreboard destination and FCSR releases are forwarded at
-  their existing release points. The existing SIMX scoreboard is not replaced
-  or modified.
-
-These are synchronous record copies, not new `SimObject`s or `SimChannel`s.
-The existing per-cycle schedule and latency are unchanged. The feedback
-methods currently have no state-changing effect.
-
-| Shell | Intended future job | Current behavior |
+| Stage | Inputs | Outputs and behavior |
 |---|---|---|
-| `GhostDependenceChecker` | Compare an incoming instruction's register and instruction-class metadata against older not-yet-issued instructions; attach dependency/ordering metadata. | Copies the typed port record unchanged. |
-| `GhostIssueBuffer` | Hold multiple decoded instructions per warp, record age and dependency state, and update state when issue/writeback events occur. | Copies the typed port record and feedback records unchanged; it is not a buffer yet. |
-| `GhostScheduler` | Select eligible older-ready entries from the issue buffer and offer per-warp candidates to the existing issue path. | Copies the typed port record and feedback records unchanged; it does not select or reorder. |
+| `GhostDependenceChecker` (DC) | One decoded I-buffer entry, same-warp IsB snapshot, and current scoreboard source-use bits. | Returns the entry annotated with IsB-bank dependency bits and in-flight source bits. Detects RAW/WAR/WAW; orders branches after older entries; allows load/load pairs but blocks other memory pairs. Invalid/full inputs are not accepted. |
+| `GhostIssueBuffer` (IsB) | A checked entry; accepted-issue, writeback, completion, branch-resolution, and flush updates. | Owns accepted traces, assigns per-warp bank/age, reports full/free locations and snapshots. Register dependencies are converted to scoreboard hazards at issue. Issued memory entries remain resident until completion so younger memory operations cannot pass an outstanding conflicting access. Flush frees unissued traces but preserves already-issued memory traces. |
+| `GhostScheduler` / ITab | IsB snapshot, per-entry scoreboard readiness, and optional pinned sequencer bank. | Places up to `SIMX_GHOST_ITAB_SIZE` oldest-ready entries in the ITab. `Core::Impl::issue()` checks candidates oldest-first against the existing scoreboard, lock, and FU-queue checks, then offers the first eligible entry per warp to the existing arbiter. |
 
-The existing Scoreboard remains responsible for hazards from already-issued
-instructions. The existing arbiter, issue locks, FU credits, operand capture,
-functional units, commit, and scoreboard release remain unchanged. The define
-does not enable any GhOST behavior in RTL or another backend. `GhostIssueUpdate`
-currently identifies the accepted sequencer micro-op; its optional IsB bank
-and index are unset because the current path has no IsB location.
+`Core::Impl::issue()` calls `ghost_admit_one()` after that tick's issue
+arbitration. Admission pops the I-buffer and decrements its fetch-inflight
+count only after IsB acceptance. Accepted issue updates the selected IsB bank;
+writeback releases source dependencies; completion removes retained memory
+entries. Branch and ordered-operation state is cleared by the existing SIMX
+control/commit events. Candidate presentation alone never consumes an entry.
+
+The existing Scoreboard, issue locks, FU credits, operand capture, functional
+units, commit, and retirement remain authoritative. Supported speculative
+classes are integer ALU/MDV/Vote/Shfl, FPU instructions without FCSR effects,
+read-only `MCYCLE`, loads, stores, and branches. Loads can pass older loads;
+other memory pairs are conservative. Branches wait for older IsB entries and
+stop younger admission until branch resolution. Atomics, fences, warp-control
+operations, macro-ops, FCSR-affecting FPU operations, other CSRs, and unknown
+classes use the ordered I-buffer fallback. Barriers/FENCE may reach their
+existing drain logic while already-issued memory entries remain in flight.
+
+The per-warp defaults are `SIMX_GHOST_ISB_SIZE=8` and
+`SIMX_GHOST_ITAB_SIZE=2`. Both are compile-time SIMX options; the ITab size
+must be positive and no larger than the IsB. Each issue slice still grants at
+most one warp per cycle; additional ITab candidates are alternatives when an
+older ready entry fails a structural eligibility check, not extra issue lanes.
 
 ## Issue trace meanings
 
@@ -201,34 +201,26 @@ warp, PC, thread mask, destination/source register metadata where present, and
 UUID. The CSV parser associates the `DEBUG Instr` opcode line with the event by
 UUID.
 
-## Test kernel and expected instruction stream
+## Test kernel and observed issue reordering
 
 The kernel includes these inline assembly operations:
 
 ```asm
-addi t0, zero, 1
-add  t1, t0, t0
-addi t2, zero, 7
-add  t3, t2, t2
-add  result, t1, t3
+lw   t0, 0(src_ptr)
+addi t2, t0, 5
+addi t1, zero, 7
+addi t0, zero, 9
+add  result, t2, t1
+addi t2, zero, 88
 ```
 
-The first `ADDI`/`ADD` chain computes 2. The second independent `ADDI`/`ADD`
-chain computes 14. The last `ADD` consumes both results, computes 16, and the
-kernel stores it to the output location for each thread. The host runner checks
-that all thread outputs equal 16.
-
-`li` aliases may appear in the assembly listing for the immediate loads, but
-the trace reports the decoded opcode (`ADDI`). In the checked SIMX run, the
-accepted operation order was:
-
-```text
-ADDI -> ADD -> ADDI -> ADD -> ADD
-```
-
-That is expected for the current pass-through foundation. The independent
-second chain is there to give a future OoO scheduler a safe candidate to move
-ahead of the first chain's dependent `ADD`; this foundation does not do so.
+Each thread loads 50; the first `ADDI` computes 55, and the independent `ADDI`
+computes 7. The following write to `t0` must not pass the older read of `t0`
+(WAR), and the final write to `t2` must not pass the older write/read sequence
+(WAW/WAR). The result operation must therefore produce 62 before `t2` is
+overwritten. The host checks every thread's output. With GhOST enabled, the
+accepted issue trace should show the independent `ADDI` overtaking the
+load-dependent `ADDI`; cycles and PCs can shift when the kernel changes.
 
 ## Build, run, and inspect
 
@@ -276,176 +268,161 @@ Do not invoke `make -C tests/regression/ghost` from the source tree. Like the
 other generated regression Makefiles, this Makefile expects the generated
 `config.mk` and configuration from the out-of-tree build.
 
-### 3. Run baseline SIMX test and produce a full debug log
+### 3. Run baseline SIMX and produce a debug log
 
 From `build/`:
 
 ```bash
-./ci/blackbox.sh \
+CONFIGS="" ./ci/blackbox.sh \
   --driver=simx \
   --app=ghost \
   --debug=3 \
-  --log=ghost.log
+  --log=ghost_baseline.log
+
+python3 ci/trace_order.py ghost_baseline.log > ghost_baseline_issue_order.csv
 ```
 
 The test should print `PASSED!`. Debug traces require a serial SIMX build;
 leave `SIMX_MT` unset (or set to 0/1) for trace collection.
 
-### 4. Convert the log to candidate/accepted issue CSV
+### 4. Run GhOST with a trace
 
-Still from `build/`:
+From `build/`:
 
 ```bash
+CONFIGS="-DSIMX_GHOST_ENABLE" ./ci/blackbox.sh \
+  --driver=simx \
+  --app=ghost \
+  --debug=3 \
+  --log=ghost.log
+
 python3 ci/trace_order.py ghost.log > ghost_issue_order.csv
-head -n 20 ghost_issue_order.csv
 ```
 
-CSV columns:
+To configure the capacities, pass compile-time defines through `CONFIGS`:
+
+```bash
+CONFIGS="-DSIMX_GHOST_ENABLE -DSIMX_GHOST_ISB_SIZE=8 -DSIMX_GHOST_ITAB_SIZE=2" \
+  ./ci/blackbox.sh --driver=simx --app=ghost
+```
+
+The defaults are 8 IsB entries and 2 ITab candidate slots per warp. `ITAB_SIZE`
+must be between 1 and `ISB_SIZE`.
+
+### 5. Inspect candidate and accepted issue order
+
+The CSV columns are:
 
 ```text
 cycle,event,core,cid,wid,pc,uuid,opcode
 ```
 
-To view only accepted issue rows:
+To inspect the small load-dependent sequence:
 
 ```bash
-python3 - <<'PY'
-import csv
-with open("ghost_issue_order.csv", newline="") as f:
-    for row in csv.DictReader(f):
-        if row["event"] == "accepted":
-            print(row["cycle"], row["wid"], row["pc"], row["uuid"], row["opcode"])
-PY
+grep -E ',(LW|ADDI|ADD)$' ghost_issue_order.csv
 ```
 
-To inspect the small ALU sequence by its PC range from the disassembly (the
-exact address can shift if the kernel changes):
-
-```bash
-grep -E ',(ADDI|ADD)$' ghost_issue_order.csv
-```
+In the verified feature-on trace, the independent `ADDI` at PC `0x80000048`
+was accepted before the load-dependent `ADDI` at PC `0x80000044`. The actual
+trace is authoritative if compiler output changes. `issue-candidate` can
+repeat and is not equivalent to accepted issue.
 
 If the parser reports no issue events, confirm the log was generated with
 `--debug=3` and that the application actually ran. The parser exits with an
 error rather than silently emitting an empty CSV.
-
-### 5. Run the opt-in pass-through path and compare
-
-From `build/`:
-
-```bash
-CONFIGS="-DSIMX_GHOST_PASSTHROUGH" \
-  ./ci/blackbox.sh \
-    --driver=simx \
-    --app=ghost \
-    --debug=3 \
-    --log=ghost_passthrough.log
-
-python3 ci/trace_order.py ghost_passthrough.log \
-  > ghost_passthrough_issue_order.csv
-
-diff -u ghost_issue_order.csv ghost_passthrough_issue_order.csv
-```
-
-The test should again print `PASSED!`, and `diff` should print nothing and
-return zero. This confirms that enabling the current pass-through shells
-preserves the observed event order and instruction results.
-
-`CONFIGS` must be applied to the blackbox invocation (not just to a previous
-application build), so the SIMX runtime is built with the define. The
-`SIMX_GHOST_PASSTHROUGH` flag is a SIMX C++ build define, not a `VX_CFG_*`
-hardware parameter.
 
 ### 6. Run from the regression Makefile
 
 From `build/`:
 
 ```bash
-make -C tests/regression run-simx-ghost
+CONFIGS="-DSIMX_GHOST_ENABLE" make -C tests/regression run-simx-ghost
 ```
 
 The test is excluded from `run-rtlsim`, `run-opae`, and `run-xrt` by design.
-The `run-simx-ghost` target is a functional regression run; use `blackbox.sh`
-with `--debug=3` when a trace is needed.
+Use `blackbox.sh` with `--debug=3` when a trace is needed.
 
-## Future implementation TODOs
+### 7. Check disabled behavior
 
-These are **future work**. They are not implemented by the current shells.
+From `build/`:
 
-### Dependence Checker
+```bash
+CONFIGS="" ./ci/blackbox.sh --driver=simx --app=ghost
+CONFIGS="" ./ci/blackbox.sh --driver=simx --app=demo
+```
 
-- Decide which decoded fields and per-warp state it consumes, including
-  register source/destination information, instruction class, current active
-  thread mask, age, and older IsB contents.
-- Define RAW, WAR, and WAW detection across not-yet-issued instructions and
-  how the existing scoreboard covers dependencies on already-issued
-  instructions.
-- Define interactions with the `Sequencer`: a macro-instruction may expand to
-  multiple micro-ops, while the current shell sits before the Sequencer. Pick
-  whether GhOST tracks decoded macro-instructions or sequenced micro-ops and
-  specify ownership/age mapping before coding a real queue.
-- Define conservative handling for memory operations, atomics, branches,
-  barriers, fences, warp-control operations, traps, and other side effects.
-- Establish backpressure and transfer semantics: a trace must not be dropped,
-  duplicated, or advanced if a downstream structure cannot accept it.
+The disabled run uses the original in-order I-buffer issue path. Apply
+`CONFIGS` to the blackbox invocation so the runtime is rebuilt with the
+requested define; GhOST options are SIMX C++ defines, not `VX_CFG_*` hardware
+parameters.
 
-### GhOST Issue Buffer
+## Current limitations and remaining work
 
-- Choose per-warp capacity and whether a shared or per-warp structure best
-  matches the SIMX timing model. Do not copy the paper checklist's 8-entry
-  capacity or metadata bit widths without confirming them against the paper
-  and the current Vortex configuration.
-- Define entry age/order and validity representation, plus dependency state
-  with explicit lifetime rules.
-- Establish a single owner and deallocation rule for each `instr_trace_t`.
-  Existing `pending_instrs_`, I-buffer backpressure counts, the sequencer's
-  cached uop, and async-trap flush behavior all need to remain consistent.
-- Specify IsB updates on accepted issue and on scoreboard/writeback release.
-  Selection/candidate presentation must not free an entry; only a successful
-  transfer into `Operands` may count as issue.
-- Define reset and per-warp flush behavior, including what happens if a trap
-  flushes instructions that have entered the future GhOST buffer.
+This is a stateful prototype, not a claim of full paper-equivalent hardware.
 
-### GhOST Scheduler / ITab
+- Multi-candidate structural fallback is implemented, but there is not yet a
+  focused test that forces the oldest ready entry to fail a structural check
+  while a younger ITab candidate issues.
+- `SIMX_GHOST_ENABLE` is opt-in and SIMX-only. RTL, runtime APIs, and other
+  drivers are unchanged.
+- Macro-ops, atomics, most CSRs, FCSR-affecting FPU operations, fences, warp
+  control, and unknown instruction classes use a conservative I-buffer path.
+  Read-only `MCYCLE` is the sole CSR exception, allowing the existing WSYNC
+  timing test to sample while loads are in flight.
+- Branches wait for older IsB work and stop younger admission until Vortex
+  resolves the branch. This does not add branch prediction or speculative
+  execution.
+- Loads may pass loads. A conflicting memory pair waits for older memory
+  completion; synchronization instructions may reach their existing unit
+  while issued memory operations drain.
+- Trace correctness, IsB flush with outstanding memory, macro-op sequencing,
+  capacity edge cases beyond the verified 4-entry/1-candidate configuration,
+  and multiple issue widths/warps still need dedicated focused tests.
+  Representative apps passing is not full coverage.
+- `GhostPipelinePorts` retains paper-shaped control records; some fields are
+  descriptive interfaces and are not yet independently driven as hardware
+  ports in SIMX.
 
-- Specify what makes an entry ready: intra-buffer dependencies, existing
-  scoreboard state, special-register hazards, functional-unit availability,
-  issue locks, and any class-specific constraints.
-- Decide whether to select one or multiple ready entries per warp, how the
-  existing `ibuffer_arbs_` receives candidates, and how failed downstream
-  acceptance retries without losing or duplicating entries.
-- Preserve the existing issue arbitration policy and structural checks unless
-  the later design explicitly calls for changing them.
-- Track actual accepted issue to update IsB dependency state. Do not update
-  as though an instruction issued merely because it was presented as a
-  candidate.
+### Follow-on tests
 
-### Follow-on validation
+- Add separate focused RAW/WAR/WAW cases with accepted-issue-order assertions
+  beyond the combined kernel smoke test.
+- Force FU-queue or issue-lock backpressure on the oldest ITab candidate and
+  verify the selected younger candidate's identity and accepted order.
+- Add directed branch, trap/flush with outstanding loads, macro-op, and custom
+  IsB/ITab size cases.
+- Exercise more than one issue width and verify candidate identity through the
+  existing warp arbiter.
+- Compare performance only after correctness; do not infer paper-level speedup
+  from the small regression.
 
-- Add correctness cases for independent instructions that should be eligible
-  to overtake a blocked older instruction, as well as RAW/WAR/WAW hazards that
-  must not be violated.
-- Add memory ordering, control-flow, barrier, trap, and micro-op tests before
-  allowing those classes to reorder.
-- Compare baseline and feature-enabled outputs and use cycle-tagged issue
-  traces to demonstrate a real reordering only after the algorithm exists.
-- Ensure default builds and all non-SIMX drivers remain unchanged.
+## Verification record
 
-## Current verification record
+In the configured XLEN=32 build:
 
-The typed-record foundation was verified in the configured XLEN=32 build:
+- The feature-on `ghost` regression passed and its trace showed independent
+  `ADDI` at PC `0x80000048` accepted before dependent `ADDI` at PC
+  `0x80000044`.
+- The expanded kernel passed its load-RAW, register-WAR, and register-WAW
+  checks; the accepted trace showed the dependent read before the older-register
+  overwrite, and the result read before the final same-register overwrite.
+- The `ghost` regression also passed with `SIMX_GHOST_ISB_SIZE=4` and
+  `SIMX_GHOST_ITAB_SIZE=1`.
+- Feature-on `basic`, `demo`, `fence`, `ldst_order`, `async_barrier`, and
+  `wsync` regressions passed.
+- The `wsync` test initially failed when in-flight memory tracking delayed its
+  counter read; allowing only non-writing `MCYCLE` reads to pass older memory
+  restored the existing drain measurement and the test passed.
+- The feature-on `demo` initially crashed because the per-warp Sequencer
+  returned a cached simple-instruction trace for a different OoO candidate.
+  Simple instructions now pass through without caching; macro-op micro-ops
+  remain cached and pinned. `demo` passes both with GhOST enabled and disabled.
+- An initial feature-off build exposed `-Werror` unused-variable failures in
+  feature-guarded issue state; the declarations now compile correctly with the
+  define either present or absent.
+- The selected tests above run on SIMX only; they do not establish full
+  paper-fidelity, all trap/macro-op safety, or other-driver behavior.
 
-- Built the default SIMX runtime with `make -C sw/runtime/simx -j2` from
-  `build/`.
-- Ran the `ghost` regression once without the define and once with
-  `CONFIGS="-DSIMX_GHOST_PASSTHROUGH"`; both logs contained `PASSED!`.
-- Parsed both debug logs with `python3 ci/trace_order.py`; the baseline and
-  pass-through CSV files compared equal with `diff -u`.
-- `git diff --check` passed.
-
-A synthetic event-log smoke test previously confirmed that the parser reports
-candidate and accepted events separately.
-
-These checks validate pass-through compatibility and the trace tool. They do
-**not** validate out-of-order scheduling, since that has intentionally not
-been implemented.
+Run `git diff --check` after edits. Keep the generated debug log and CSV in the
+build directory when reproducing the observed issue order.
